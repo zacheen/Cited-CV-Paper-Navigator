@@ -859,6 +859,34 @@ def run_recent_summary(prompt: str, top_k: int, recent_days: int, model_name: st
 
 st.set_page_config(page_title="CV Paper RAG", page_icon="CV", layout="wide")
 
+# Block Ctrl+C / Cmd+C from triggering Streamlit's built-in "Clear cache"
+# shortcut. Streamlit listens for plain 'c' but doesn't reliably filter out
+# events where a modifier key is held, so the browser's standard copy
+# shortcut accidentally pops the dev dialog. We add a capture-phase listener
+# so our handler runs *before* Streamlit's and stops propagation when Ctrl
+# or Cmd is held — native browser copy still works because we don't
+# preventDefault. Plain 'c' (Streamlit's intended shortcut) is left alone.
+#
+# Idempotent across script reruns via window.__cvragCtrlCFix sentinel:
+# each st.markdown call re-renders this <script>, and without the guard
+# we'd accumulate a new listener every rerun.
+st.markdown(
+    """
+    <script>
+    (function() {
+        if (window.__cvragCtrlCFix) return;
+        window.__cvragCtrlCFix = true;
+        window.addEventListener('keydown', function(e) {
+            if ((e.key === 'c' || e.key === 'C') && (e.ctrlKey || e.metaKey)) {
+                e.stopPropagation();
+            }
+        }, true);  // capture phase — fires before Streamlit's handler
+    })();
+    </script>
+    """,
+    unsafe_allow_html=True,
+)
+
 # Tighten Streamlit's default top padding (~6rem) on the main content and
 # sidebar so the title / Settings header sit closer to the page top.
 # Multiple selectors cover Streamlit version differences; !important wins
