@@ -732,8 +732,36 @@ def run_recent_summary(prompt: str, top_k: int, recent_days: int, model_name: st
                 "role": "assistant",
                 "content": response,
                 "sources": sources,
+                # Persisted across reruns so the chat history loop can show
+                # which window was actually used. The st.status box itself
+                # is ephemeral — it only exists during the run that creates
+                # it, so we save the window here for the history loop to
+                # display as a caption on subsequent renders.
+                "search_window_days": window_used,
             }
         )
+
+        # Persist the window we actually used into the shared time_range
+        # state. This serves two purposes:
+        #   1. The sidebar's "Current search range" syncs to it.
+        #   2. Subsequent chat-mode queries pick up start_date/end_date from
+        #      this same state (see app.py reading time_range for retrieve())
+        #      — so follow-up questions auto-filter to the same window the
+        #      summary covered.
+        _today = datetime.date.today()
+        st.session_state["time_range"] = {
+            "start_date": (_today - datetime.timedelta(days=window_used)).isoformat(),
+            "end_date": _today.isoformat(),
+        }
+
+        # Streamlit only renders the sidebar once per script run, and it ran
+        # *before* the state update above. Without rerun, the sidebar stays
+        # stale until the user's next interaction. Rerunning re-renders it
+        # immediately — the ephemeral status box is lost in the process, but
+        # the assistant message's "Searched last N days" caption (saved via
+        # search_window_days above) preserves the key piece of info.
+        if window_used != recent_days:
+            st.rerun()
 
 
 st.set_page_config(page_title="CV Paper RAG", page_icon="CV", layout="wide")
@@ -1014,6 +1042,11 @@ else:
 
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
+        # If this assistant message came from a recent-summary run that
+        # expanded its window past the requested days, surface that here —
+        # the ephemeral st.status box no longer exists after a rerun.
+        if "search_window_days" in msg:
+            st.caption(f"Searched last {msg['search_window_days']} days")
         st.write(msg["content"])
         if "sources" in msg:
             with st.expander("Sources"):
