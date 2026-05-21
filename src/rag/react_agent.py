@@ -29,6 +29,7 @@ from src.rag.tools import (
     get_react_tools,
     react_retrieval_state,
     react_search_state,
+    time_range_state,
 )
 
 
@@ -49,6 +50,16 @@ REACT_SYSTEM_PROMPT_TEMPLATE = (
     "Rules:\n"
     "- Final answer must be grounded in the chunks retrieved by your tool "
     "calls. Do not use outside knowledge or invent details.\n"
+    "- **You MUST call search_papers at least once before answering any "
+    "question that mentions papers, asks whether a paper exists on a "
+    "topic, or requests information about a paper's content.** Do not "
+    "rely on chat history alone for paper claims — papers mentioned in "
+    "earlier turns may not match the current question, and re-retrieving "
+    "is how you ground your answer in evidence the user can verify in "
+    "the Sources panel.\n"
+    "- The only exceptions are pure meta-questions about the system "
+    "itself (e.g. \"how does this work?\") or follow-ups that don't "
+    "involve specific paper claims.\n"
     "- Vary your search queries — repeating the same query is detected "
     "and returns an empty observation.\n"
     "- You have a hard cap of {max_steps} tool-calling rounds; plan "
@@ -56,7 +67,18 @@ REACT_SYSTEM_PROMPT_TEMPLATE = (
     "you have.\n"
     "- Cite paper titles in your answer when possible.\n"
     "\n"
-    "Today's date is {today}."
+    "Date filter policy:\n"
+    "- The user may have an active publication-date filter (see below). "
+    "Treat it as a hard constraint on what to search — do NOT call "
+    "clear_time_range to broaden the search unless the user explicitly "
+    "asks to ignore the filter (phrases like \"ignore the time filter\", "
+    "\"search all papers\", \"no date filter\"). The active filter is the "
+    "user's deliberate choice from previous interactions.\n"
+    "- Only call set_time_range when the user explicitly requests a "
+    "different date range in their current message.\n"
+    "\n"
+    "Today's date is {today}.\n"
+    "Current active time range filter: {current_range}."
 )
 
 
@@ -162,8 +184,18 @@ def run_react(
         return
 
     today = datetime.date.today().isoformat()
+    # Surface the active time-range filter to the model so it doesn't
+    # blindly clear it when the user's prompt doesn't mention dates. Mirror
+    # of how generator_gemini.PRE_RAG_SYSTEM_PROMPT formats current_range.
+    if time_range_state.start_date and time_range_state.end_date:
+        current_range = (
+            f"{time_range_state.start_date} -> {time_range_state.end_date} "
+            "(preserve unless user explicitly asks to clear)"
+        )
+    else:
+        current_range = "All time (no filter)"
     system_instruction = REACT_SYSTEM_PROMPT_TEMPLATE.format(
-        max_steps=max_steps, today=today
+        max_steps=max_steps, today=today, current_range=current_range
     )
 
     contents: list = [

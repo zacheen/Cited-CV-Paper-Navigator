@@ -553,6 +553,14 @@ def run_react_query(prompt: str, model_name: str, backend: str) -> None:
 
     _wait_for_downloads()
 
+    # Push the Streamlit-side time_range into the module-level state that
+    # ReAct's search_papers tool reads. Without this sync, a date window set
+    # by the Summarize button (or by a previous Gemini set_time_range tool
+    # call) lives in st.session_state but never reaches the ReAct loop, so
+    # follow-up searches see no date filter and pull in papers from outside
+    # the displayed range. Mirror of what run_query() does for Single-pass.
+    _sync_time_range_to_module()
+
     with st.chat_message("assistant"):
         with st.status("ReAct loop running...", expanded=True) as status:
             final: ReactFinish | None = None
@@ -650,6 +658,11 @@ def run_react_query(prompt: str, model_name: str, backend: str) -> None:
                 "sources": sources,
             }
         )
+
+    # ReAct's tools (set_time_range / clear_time_range) mutate the
+    # module-level state. Push any changes back to session_state so the
+    # sidebar's "Current search range" reflects what the agent decided.
+    _sync_time_range_from_module()
 
     st.rerun()
 
@@ -1172,7 +1185,12 @@ for msg in st.session_state.messages:
         if "search_window_days" in msg:
             st.caption(f"Searched last {msg['search_window_days']} days")
         st.write(msg["content"])
-        if "sources" in msg:
+        # `msg.get("sources")` (truthy check) not `"sources" in msg` (key
+        # existence) — ReAct turns where the LLM never called search_papers
+        # store `sources: []`, and we don't want to render an empty Sources
+        # expander shell. Matches the first-render guards in run_react_query
+        # and run_recent_summary.
+        if msg.get("sources"):
             with st.expander("Sources"):
                 for source in msg["sources"]:
                     title = source.get("title", "Unknown")
