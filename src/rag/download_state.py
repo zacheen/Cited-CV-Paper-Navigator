@@ -18,6 +18,7 @@ from __future__ import annotations
 import datetime
 import re
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -150,7 +151,14 @@ def get_log_snapshot() -> list[DownloadJobEntry]:
 
 
 def is_busy() -> bool:
-    """True iff at least one background download/ingest worker is running."""
+    """True iff a short-running background job is currently in flight.
+
+    Covers citation downloads (typically ~30s for 1-5 papers). Does **not**
+    cover the long-running past-trend ingestion job — that has its own
+    :func:`is_past_trend_running` flag because conflating the two would
+    force unrelated UI paths (e.g. ``_wait_for_downloads``) to block for
+    10+ minutes during a past-trend run.
+    """
     with _lock:
         return _busy_count > 0
 
@@ -264,6 +272,104 @@ def enqueue_citation_download(
         "skipped": 0,
         "source_paper_id": source_paper_id,
     }
+
+
+# ----------------------------------------------------------------------
+# Past-trend (HF Daily CV ingestion) background job
+# ----------------------------------------------------------------------
+# Used by the Streamlit "Summarize new papers" button: after the synchronous
+# summary completes, kick off a background `run_past_trend()` so the next
+# click sees fresher data. Lives in the same module as citation downloads
+# because it shares _busy_count / record_result / threading semantics —
+# _wait_for_downloads() in app.py blocks on both via is_busy().
+
+_past_trend_lock = threading.Lock()
+_past_trend_in_flight: bool = False
+_past_trend_last_completed_at: float = 0.0  # monotonic time of last finish
+
+# Don't re-trigger if a job finished within this many seconds — the data is
+# already as fresh as the previous run could make it. Prevents rapid clicking
+# from hammering arXiv + HF unnecessarily.
+_PAST_TREND_FRESHNESS_WINDOW_SEC = 30 * 60  # 30 minutes
+
+
+def is_past_trend_running() -> bool:
+    """True iff a background past-trend ingestion job is currently in flight."""
+    with _past_trend_lock:
+        return _past_trend_in_flight
+
+
+def enqueue_past_trend_download(
+    days_back: int = 7,
+    min_new_papers: int | None = 3,
+    max_days_back: int = 30,
+    stop_on_indexed: bool = True,
+) -> bool:
+    """Kick off a background past-trend ingestion thread.
+
+    Skips (returns False) if a job is already running, or if one completed
+    within the freshness window. Returns True if a new thread was started.
+
+    Args mirror :func:`src.ingestion.past_trend.run_past_trend`. Default
+    ``stop_on_indexed=True`` matches the past-trend CLI semantics — walk
+    backwards filling the corpus until hitting already-synced ground.
+    """
+    global _past_trend_in_flight, _past_trend_last_completed_at, _busy_count
+
+    with _past_trend_lock:
+        if _past_trend_in_flight:
+            return False
+        if _past_trend_last_completed_at > 0:
+            since = time.monotonic() - _past_trend_last_completed_at
+            if since < _PAST_TREND_FRESHNESS_WINDOW_SEC:
+                return False
+        _past_trend_in_flight = True
+
+    # Deliberately NOT incrementing _busy_count — past_trend can run for 10+
+    # minutes and conflating it with citation downloads forces every call to
+    # _wait_for_downloads() (which polls is_busy()) to block for that long.
+    # Callers that specifically care about past_trend status use
+    # is_past_trend_running() instead.
+
+    record_result(
+        arxiv_id="recent_paper_ingestion",
+        status="running",
+        reason=f"Fetching recent CV papers (window: {days_back}-{max_days_back} days)",
+    )
+
+    def _run() -> None:
+        global _past_trend_in_flight, _past_trend_last_completed_at
+        try:
+            # Lazy import: keeps download_state import-light and avoids any
+            # circular import at module load time (past_trend pulls in
+            # embedder/chunker which are heavier).
+            from src.ingestion.past_trend import run_past_trend  # noqa: PLC0415
+
+            run_past_trend(
+                days_back=days_back,
+                min_new_papers=min_new_papers,
+                stop_on_indexed=stop_on_indexed,
+                max_days_back=max_days_back,
+            )
+            record_result(
+                arxiv_id="recent_paper_ingestion",
+                status="ok",
+                reason="Recent paper ingestion complete",
+            )
+        except Exception as exc:  # noqa: BLE001
+            record_result(
+                arxiv_id="recent_paper_ingestion",
+                status="failed",
+                reason=f"Past-trend worker crashed: {exc!r}",
+            )
+        finally:
+            with _past_trend_lock:
+                _past_trend_in_flight = False
+                _past_trend_last_completed_at = time.monotonic()
+
+    thread = threading.Thread(target=_run, daemon=True, name="past-trend-worker")
+    thread.start()
+    return True
 
 
 def mark_arxiv_in_flight(arxiv_id: str) -> bool:

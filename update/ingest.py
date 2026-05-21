@@ -4,7 +4,7 @@ import sys
 import argparse
 from pathlib import Path
 
-# Allow running as `python data/ingest.py` from project root
+# Allow running as `python update/ingest.py` from project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.config import ARXIV_MAX_RESULTS, PDF_DIR

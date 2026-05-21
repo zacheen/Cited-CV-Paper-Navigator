@@ -170,8 +170,9 @@ arXiv API / Hugging Face Daily Papers
 | File | Purpose |
 |------|---------|
 | `app.py` | Streamlit UI with chat, recent-paper summary button, and follow-up flow |
-| `data/ingest.py` | arXiv ingestion pipeline |
-| `data/get_past_trend.py` | Hugging Face daily paper ingestion pipeline |
+| `update/ingest.py` | arXiv ingestion pipeline (CLI) |
+| `update/get_past_trend.py` | Hugging Face past-trend ingestion (CLI wrapper around `src/ingestion/past_trend.py`) |
+| `update/get_today_trend.py` | Daily cron entry point for HF Daily Papers |
 | `src/config.py` | central configuration and prompts |
 | `src/ingestion/arxiv_downloader.py` | arXiv API search and PDF download |
 | `src/ingestion/hf_downloader.py` | Hugging Face daily paper retrieval |

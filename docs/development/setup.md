@@ -55,13 +55,13 @@ The ingestion script queries the [arXiv API](https://info.arxiv.org/help/api/ind
 
 ```bash
 # Default: download 800 latest cs.CV papers and build vector database
-python data/ingest.py --max-papers 800
+python update/ingest.py --max-papers 800
 
 # Filter by topic
-python data/ingest.py --query "object detection" --max-papers 800
+python update/ingest.py --query "object detection" --max-papers 800
 
 # Process already-downloaded PDFs only (skip arXiv API + download)
-python data/ingest.py --skip-download
+python update/ingest.py --skip-download
 ```
 
 ### Output

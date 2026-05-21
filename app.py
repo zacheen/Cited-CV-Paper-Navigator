@@ -28,9 +28,11 @@ from src.processing.reranker import get_reranker, is_reranker_loaded
 from src.rag import download_state
 from src.rag.download_state import (
     enqueue_citation_download,
+    enqueue_past_trend_download,
     extract_inline_citations,
     get_log_snapshot,
     is_busy,
+    is_past_trend_running,
     take_log_change_signal,
 )
 from src.rag.generator import generate_answer_stream as ollama_generate_answer_stream
@@ -198,6 +200,56 @@ def _kickoff_reranker_warmup() -> bool:
 _kickoff_reranker_warmup()
 
 
+@st.cache_resource
+def _kickoff_past_trend_warmup() -> bool:
+    """Trigger a background past-trend ingestion at app startup if the corpus
+    looks stale.
+
+    "Stale" = fewer than 3 distinct papers indexed in the last 7 days. This
+    mirrors the Summarize button's expansion threshold — we only kick off
+    when a button click would otherwise have to expand its window past the
+    default 7-day window.
+
+    Runs in a daemon thread so the staleness check + thread spawn don't add
+    latency to first-paint. The actual ingestion is already a background
+    thread inside :func:`enqueue_past_trend_download`; this warmup just
+    decides whether to fire it.
+
+    Wrapped in ``@st.cache_resource`` so it fires exactly once per Streamlit
+    process — script reruns hit the cached sentinel and don't re-spawn.
+    """
+    def _warmup() -> None:
+        try:
+            # Cheap metadata-only check via the lite collection. We just need
+            # to know "do we have at least 3 papers from the last 7 days?";
+            # max_papers=3 means retrieve_recent_papers stops at the threshold.
+            papers = retrieve_recent_papers(
+                recent_days=7,
+                max_papers=3,
+                collection=get_cached_lite_collection(),
+            )
+            if len(papers) >= 3:
+                return  # Fresh enough — skip startup trigger
+        except Exception as exc:  # noqa: BLE001
+            # Don't let a freshness-check failure hide the user's data from
+            # an ingestion they'd benefit from. Fall through and trigger.
+            print(
+                f"[past-trend-warmup] freshness check failed: {exc!r}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+        enqueue_past_trend_download(days_back=7, min_new_papers=3)
+
+    thread = threading.Thread(target=_warmup, daemon=True, name="past-trend-warmup")
+    add_script_run_ctx(thread)
+    thread.start()
+    return True
+
+
+_kickoff_past_trend_warmup()
+
+
 def get_generate_answer_stream(backend: str):
     """Return the streaming generator function for the chosen backend."""
     if backend == "gemini":
@@ -225,12 +277,28 @@ def _sync_time_range_from_module() -> None:
     st.session_state["time_range"] = time_range_state.to_dict()
 
 
-def _wait_for_downloads(max_seconds: float = 60.0) -> None:
-    """Block until all background ingestion jobs finish, with a spinner."""
+def _wait_for_downloads(
+    max_seconds: float = 60.0,
+    message: str = "Waiting for background paper downloads to finish...",
+) -> None:
+    """Block on short-running background jobs (citation downloads), with a
+    spinner and a hard deadline.
+
+    Only waits while ``is_busy()`` is True. Past-trend ingestion is tracked
+    separately via :func:`is_past_trend_running` and deliberately doesn't
+    trip ``is_busy()`` — see download_state.is_busy docstring — so this
+    function never blocks on it.
+
+    On timeout (``max_seconds`` elapsed before ``is_busy()`` clears), we
+    return without raising. The caller proceeds with whatever's in the DB,
+    and the unfinished background job continues running in its own thread.
+
+    Default 60s fits typical citation downloads (1-5 papers, ~20s each).
+    """
     if not is_busy():
         return
     deadline = time.monotonic() + max_seconds
-    with st.spinner("Waiting for background paper downloads to finish..."):
+    with st.spinner(message):
         while is_busy() and time.monotonic() < deadline:
             time.sleep(0.3)
 
@@ -591,7 +659,7 @@ def run_recent_summary(prompt: str, top_k: int, recent_days: int, model_name: st
                        max_days_back: int = 30) -> None:
     """Summarize recent papers directly from DB metadata instead of vector search.
 
-    Expanding-window behavior (matches data/get_past_trend.py semantics):
+    Expanding-window behavior (matches update/get_past_trend.py semantics):
         Start at ``recent_days``. If fewer than ``min_papers`` papers are
         indexed in that window, expand by ``recent_days`` each step
         (e.g. 7 → 14 → 21 → 28) up to ``max_days_back``. Stop at the first
@@ -602,7 +670,18 @@ def run_recent_summary(prompt: str, top_k: int, recent_days: int, model_name: st
     with st.chat_message("user"):
         st.write(prompt)
 
-    _wait_for_downloads()
+    # Recent-summary mode is purely a metadata-only date filter on `hf_date`
+    # — it does not consult any of the chunks that citation downloads pull
+    # in (those papers typically have empty hf_date because they were never
+    # in HF Daily Papers). So there's no reason to block on either kind of
+    # background job here:
+    #   - Past-trend ingestion (10+ min) is intentionally never waited on;
+    #     the "still downloading" note below tells the user to come back.
+    #   - Citation downloads (~30s, short) are also irrelevant to this
+    #     query's results.
+    # If future changes make summary mode depend on chunks from citation
+    # downloads, restore `_wait_for_downloads()` here.
+    bg_running_now = is_past_trend_running()
 
     # Recent-summary mode does a metadata-only lookup, no vector retrieval —
     # clear the sidebar's retrieval query so it doesn't show a stale value
@@ -701,6 +780,20 @@ def run_recent_summary(prompt: str, top_k: int, recent_days: int, model_name: st
             else:
                 response = f"Generation failed: {e}. Is Ollama running with {model_name}?"
             st.error(response)
+
+        # If the startup-triggered past-trend ingestion is still running, let
+        # the user know they're seeing a snapshot of pre-update data — newer
+        # papers may land mid-conversation. The note is appended to the
+        # persisted message content so it survives the upcoming st.rerun()
+        # (sidebar time_range sync) via the chat-history render loop.
+        if bg_running_now:
+            bg_note = (
+                "\n\n---\n*A background ingestion of the newest CV papers "
+                "is still running. Click **Summarize** again in a few "
+                "minutes for fresher results.*"
+            )
+            response = (response or "") + bg_note
+            st.markdown(bg_note)
 
         sources = [
             {
@@ -948,7 +1041,10 @@ with st.sidebar:
     # this to decide whether to enable polling. Once polling reaches a
     # busy → idle transition it forces a full script rerun so the next
     # fragment instantiation drops ``run_every`` and stops ticking.
-    _busy_at_render = is_busy()
+    # Past-trend doesn't count toward is_busy() (it has its own flag — see
+    # download_state.is_busy docstring). Without the OR, the sidebar would
+    # go silent during a 10+ minute past-trend run.
+    _busy_at_render = is_busy() or is_past_trend_running()
 
     @st.fragment(run_every="2s" if _busy_at_render else None)
     def _download_log_fragment() -> None:
@@ -980,7 +1076,7 @@ with st.sidebar:
                     line += f" — {entry.reason}"
                 st.markdown(line)
 
-        currently_busy = is_busy()
+        currently_busy = is_busy() or is_past_trend_running()
         if currently_busy:
             st.caption("Background ingestion in progress...")
         elif _busy_at_render:

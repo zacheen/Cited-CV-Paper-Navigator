@@ -266,7 +266,7 @@ processed twice across the lifetime of the corpus.
 3. For each remaining arxiv id, **re-run the dedup gates** (the corpus may
    have changed since the job was queued).
 4. Run `download_pdf` → `parse_pdf` → `chunk_document` → `index_chunks`
-   (same pipeline as `data/ingest.py`).
+   (same pipeline as `update/ingest.py`).
 5. Update `download_state` job entry. Clear `download_in_progress` when the
    queue empties.
 
@@ -282,7 +282,7 @@ processed twice across the lifetime of the corpus.
   `extract_inline_citations(retrieved_chunks) -> dict[paper_id, list[int]]`).
 - `src/ingestion/citation_resolver.py` — Semantic Scholar wrapper:
   `resolve_references(arxiv_id) -> list[dict]`.
-- `src/ingestion/ingest_single.py` — refactor of `data/ingest.py`'s inner
+- `src/ingestion/ingest_single.py` — refactor of `update/ingest.py`'s inner
   loop into `ingest_paper(arxiv_id_or_paper_dict)` so it's reusable from a
   background thread.
 

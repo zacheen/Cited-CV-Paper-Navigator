@@ -64,9 +64,9 @@ If the two numbers differ, `MAX(rowid)` is no longer safe.
 1. Maintain `data/chroma_db/.chunk_count` as a single-line text file holding
    the current count.
 2. Update it at the end of every ingestion script
-   ([data/ingest.py](../data/ingest.py),
-   [data/get_today_trend.py](../data/get_today_trend.py),
-   [data/get_past_trend.py](../data/get_past_trend.py))
+   ([update/ingest.py](../update/ingest.py),
+   [update/get_today_trend.py](../update/get_today_trend.py),
+   [update/get_past_trend.py](../update/get_past_trend.py))
    by calling `Collection.count()` once on the warm path.
 3. `get_chunk_count_fast()` reads the file (< 1 ms) instead of querying SQLite.
 
