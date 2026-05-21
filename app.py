@@ -587,8 +587,17 @@ def run_react_query(prompt: str, model_name: str, backend: str) -> None:
 
 
 def run_recent_summary(prompt: str, top_k: int, recent_days: int, model_name: str,
-                       backend: str = "ollama") -> None:
-    """Summarize recent papers directly from DB metadata instead of vector search."""
+                       backend: str = "ollama", min_papers: int = 3,
+                       max_days_back: int = 30) -> None:
+    """Summarize recent papers directly from DB metadata instead of vector search.
+
+    Expanding-window behavior (matches data/get_past_trend.py semantics):
+        Start at ``recent_days``. If fewer than ``min_papers`` papers are
+        indexed in that window, expand by ``recent_days`` each step
+        (e.g. 7 → 14 → 21 → 28) up to ``max_days_back``. Stop at the first
+        window that hits the threshold, or fall through to ``max_days_back``
+        and use whatever was found.
+    """
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.write(prompt)
@@ -600,6 +609,17 @@ def run_recent_summary(prompt: str, top_k: int, recent_days: int, model_name: st
     # from a previous chat turn.
     retrieval_query_state.clear()
 
+    # Build the expansion ladder once. For recent_days=7, max_days_back=30:
+    # [7, 14, 21, 28, 30]. Each entry is a window size we'll try in order.
+    windows: list[int] = []
+    step = max(1, recent_days)
+    w = step
+    while w < max_days_back:
+        windows.append(w)
+        w += step
+    if not windows or windows[-1] < max_days_back:
+        windows.append(max_days_back)
+
     with st.chat_message("assistant"):
         with st.status(
             f"Looking up papers from the last {recent_days} days...",
@@ -608,32 +628,47 @@ def run_recent_summary(prompt: str, top_k: int, recent_days: int, model_name: st
             # retrieve_recent_papers does a metadata-only date filter
             # (collection.get(where=...)) so it can use the lite collection
             # and skip the SentenceTransformer load entirely.
-            try:
-                results = retrieve_recent_papers(
-                    recent_days=recent_days,
-                    max_papers=top_k,
-                    collection=get_cached_lite_collection(),
-                )
-            except Exception as e:
-                status.update(label=f"Lookup failed: {e}", state="error", expanded=True)
-                st.error(f"Recent paper lookup failed: {e}. Make sure you've run the ingestion script.")
-                st.stop()
+            collection_lite = get_cached_lite_collection()
+            results: list[dict] = []
+            window_used = windows[-1]
+            for idx, window in enumerate(windows):
+                try:
+                    results = retrieve_recent_papers(
+                        recent_days=window,
+                        max_papers=top_k,
+                        collection=collection_lite,
+                    )
+                except Exception as e:
+                    status.update(label=f"Lookup failed: {e}", state="error", expanded=True)
+                    st.error(f"Recent paper lookup failed: {e}. Make sure you've run the ingestion script.")
+                    st.stop()
+
+                window_used = window
+                if len(results) >= min_papers:
+                    break
+                # Not enough yet — report and expand (unless we're already at the cap).
+                if idx < len(windows) - 1:
+                    next_window = windows[idx + 1]
+                    status.write(
+                        f"Only {len(results)} paper(s) in last {window} days, "
+                        f"expanding to {next_window} days..."
+                    )
 
             if not results:
                 status.update(
-                    label=f"No indexed papers in the last {recent_days} days",
+                    label=f"No indexed papers in the last {window_used} days",
                     state="error",
                     expanded=True,
                 )
                 response = (
-                    f"I couldn't find any indexed papers published in the last {recent_days} days. "
-                    "Re-run ingestion to fetch newer arXiv papers."
+                    f"I couldn't find any indexed papers published in the last "
+                    f"{window_used} days. Re-run ingestion to fetch newer arXiv papers."
                 )
                 st.write(response)
                 st.session_state.messages.append({"role": "assistant", "content": response})
                 return
 
-            status.write(f"Found {len(results)} papers")
+            status.write(f"Found {len(results)} papers in last {window_used} days")
 
             context = format_context(results)
 
@@ -643,7 +678,7 @@ def run_recent_summary(prompt: str, top_k: int, recent_days: int, model_name: st
                     history.append({"role": message["role"], "content": message["content"]})
 
             status.update(
-                label=f"Found {len(results)} papers — generating summary below",
+                label=f"Found {len(results)} papers in last {window_used} days — generating summary below",
                 state="complete",
                 expanded=False,
             )
