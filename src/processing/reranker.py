@@ -14,17 +14,22 @@ takes ~50ms — small relative to the LLM generation step that follows.
 
 import sys
 import threading
-
-from sentence_transformers import CrossEncoder
+from typing import TYPE_CHECKING
 
 from src.config import RERANKER_MODEL
+
+if TYPE_CHECKING:
+    # Type-only import: keeps annotations precise for IDE/mypy without
+    # pulling sentence_transformers (and its transformers/sklearn/torch
+    # transitive chain, ~35s cold) into the main thread at module load.
+    from sentence_transformers import CrossEncoder
 
 
 # Module-level singleton. CrossEncoder allocates ~80MB and spins up torch
 # tensors; we only want one instance per process. ``_reranker_lock`` makes
 # concurrent first-callers cooperate (background warmup vs. first user
 # query racing each other).
-_reranker: CrossEncoder | None = None
+_reranker: "CrossEncoder | None" = None
 _reranker_lock = threading.Lock()
 _reranker_loaded = threading.Event()
 
@@ -34,13 +39,19 @@ def is_reranker_loaded() -> bool:
     return _reranker_loaded.is_set()
 
 
-def get_reranker() -> CrossEncoder:
+def get_reranker() -> "CrossEncoder":
     """Return the process-wide cross-encoder, loading it on first call."""
     global _reranker
     if _reranker is not None:
         return _reranker
     with _reranker_lock:
         if _reranker is None:
+            # Deferred import: this is the actual ~35s import cost. Kept
+            # inside the function so the cost lands on whichever thread
+            # first calls get_reranker() — normally the background warmup
+            # thread spawned at app startup, not the main thread.
+            from sentence_transformers import CrossEncoder
+
             print(
                 f"[reranker] loading {RERANKER_MODEL}...",
                 file=sys.stderr,
