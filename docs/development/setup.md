@@ -16,6 +16,29 @@ pip install PyMuPDF chromadb sentence-transformers
 
 No GPU or Ollama needed for this phase.
 
+### Hugging Face Token (recommended)
+
+The first ingest (and the first app start on a fresh machine) downloads two
+small models from Hugging Face Hub via `sentence-transformers`:
+
+- `all-MiniLM-L6-v2` — embedder (~90 MB)
+- `cross-encoder/ms-marco-MiniLM-L-6-v2` — reranker (~80 MB)
+
+Without a token these downloads run anonymously and share a low per-IP rate
+limit. To avoid the `Warning: You are sending unauthenticated requests to the
+HF Hub` message — and the rate-limit risk it implies — create a free
+read-only token at https://huggingface.co/settings/tokens and add it to
+`.env`:
+
+```
+HF_TOKEN = hf_xxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+`src/config.py` loads `.env` on import, and `huggingface_hub` picks the
+token up automatically — no code changes needed. The models cache to
+`~/.cache/huggingface/hub/` after the first download, so subsequent runs
+won't hit the network at all.
+
 ### Paper Selection Criteria
 
 The ingestion script queries the [arXiv API](https://info.arxiv.org/help/api/index.html) with the following defaults:
