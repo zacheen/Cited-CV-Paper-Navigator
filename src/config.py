@@ -53,6 +53,11 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-flash-lite")
 # LLM backend selector: "ollama" (default, original behavior) or "gemini".
 LLM_BACKEND = os.getenv("LLM_BACKEND", "ollama")
 
+# ReAct agent — maximum tool-calling rounds before forcing a final answer.
+# Each round is one (LLM call, tool execution) pair. Past 3 rounds, latency
+# starts to dominate without much extra retrieval signal in our experience.
+REACT_MAX_STEPS = 3
+
 # RAG prompt template
 RAG_SYSTEM_PROMPT = (
     "You are a research assistant specializing in computer vision. "

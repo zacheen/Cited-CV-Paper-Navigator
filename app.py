@@ -39,8 +39,13 @@ from src.rag.generator_gemini import (
     generate_answer_stream as gemini_generate_answer_stream,
     run_pre_rag_pass,
 )
+from src.rag.react_agent import ReactFinish, ReactStep, run_react
 from src.rag.retriever import format_context, retrieve, retrieve_recent_papers
-from src.rag.tools import retrieval_query_state, time_range_state
+from src.rag.tools import (
+    retrieval_query_state,
+    set_collection_provider as set_react_collection_provider,
+    time_range_state,
+)
 
 _ts("heavy imports done (streamlit, chromadb, google.genai, ollama, project src)")
 
@@ -74,6 +79,12 @@ def get_cached_collection():
 # to import Streamlit. Only the lite collection is needed there because
 # _is_in_db only does metadata lookups.
 download_state.set_lite_collection_provider(get_cached_lite_collection)
+
+# Same pattern for the ReAct tools: they call retrieve() under the hood and
+# need the SentenceTransformer-backed collection. Wiring it through the
+# Streamlit cache means a CLI test of the tools still works (falls back to
+# get_collection() inside tools.py) but the UI reuses the warm cache.
+set_react_collection_provider(get_cached_collection)
 
 
 @st.cache_resource(show_spinner=False)
@@ -446,6 +457,135 @@ def run_query(
     st.rerun()
 
 
+def run_react_query(prompt: str, model_name: str, backend: str) -> None:
+    """Execute one ReAct-loop query and append the result to session history.
+
+    Streams ``ReactStep`` events into a live ``st.status`` block so the user
+    sees each (thought, action, observation) as the loop runs, then renders
+    the final ``ReactFinish.answer`` and accumulated sources just like
+    :func:`run_query` does.
+
+    Gemini-only on this branch — Ollama doesn't have a function-calling
+    integration story we trust here.
+    """
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.write(prompt)
+
+    if backend != "gemini":
+        with st.chat_message("assistant"):
+            err = (
+                "ReAct mode requires the Gemini backend on this branch. "
+                "Switch backend to `gemini` in the sidebar, or change Query "
+                "mode back to `Single-pass`."
+            )
+            st.error(err)
+            st.session_state.messages.append({"role": "assistant", "content": err})
+        return
+
+    _wait_for_downloads()
+
+    with st.chat_message("assistant"):
+        with st.status("ReAct loop running...", expanded=True) as status:
+            final: ReactFinish | None = None
+            try:
+                for event in run_react(prompt, model=model_name):
+                    if isinstance(event, ReactStep):
+                        status.update(label=f"Step {event.n}: {event.action}(...)")
+                        st.markdown(
+                            f"**Step {event.n}** — `{event.action}("
+                            f"{', '.join(f'{k}={v!r}' for k, v in event.action_args.items())})`"
+                        )
+                        if event.thought:
+                            st.markdown(f"> _Thought:_ {event.thought}")
+                        # Truncate observation in the trace so a 20-chunk
+                        # search dump doesn't dominate the UI; the full
+                        # context goes to the LLM regardless.
+                        obs = event.observation
+                        if len(obs) > 1500:
+                            obs = obs[:1500].rstrip() + "\n... [truncated]"
+                        st.code(obs, language="text")
+                    elif isinstance(event, ReactFinish):
+                        final = event
+                        label_suffix = {
+                            "natural": "complete",
+                            "max_steps": "complete (max steps reached)",
+                            "error": "complete (error)",
+                        }.get(event.terminated_by, "complete")
+                        status.update(
+                            label=f"ReAct loop {label_suffix}",
+                            state=(
+                                "error" if event.terminated_by == "error"
+                                else "complete"
+                            ),
+                            expanded=False,
+                        )
+            except Exception as exc:  # noqa: BLE001
+                status.update(
+                    label=f"ReAct loop failed: {exc}",
+                    state="error",
+                    expanded=True,
+                )
+                err = f"ReAct loop failed: {exc}"
+                st.error(err)
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": err}
+                )
+                return
+
+        if final is None:
+            err = "ReAct loop ended without producing a final answer."
+            st.error(err)
+            st.session_state.messages.append(
+                {"role": "assistant", "content": err}
+            )
+            return
+
+        st.markdown(final.answer)
+
+        sources = [
+            {
+                "title": result.get("title", ""),
+                "arxiv_url": result.get("arxiv_url", ""),
+                "authors": result.get("authors", ""),
+                "passage": (result.get("text") or "")[:300],
+                "distance": result.get("distance", 0.0),
+            }
+            for result in final.sources
+        ]
+        if sources:
+            with st.expander("Sources"):
+                for source in sources:
+                    url = source.get("arxiv_url", "")
+                    if url:
+                        st.markdown(
+                            f"**[{source['title']}]({url})** "
+                            f"(similarity: {1 - source['distance']:.2%})"
+                        )
+                    else:
+                        st.markdown(
+                            f"**{source['title']}** "
+                            f"(similarity: {1 - source['distance']:.2%})"
+                        )
+                    if source.get("authors"):
+                        st.caption(source["authors"])
+                    st.markdown(
+                        f"> {source['passage']}"
+                        f"{'...' if len(source['passage']) >= 300 else ''}"
+                    )
+                    st.divider()
+
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": final.answer,
+                "sources": sources,
+            }
+        )
+
+    st.rerun()
+
+
 def run_recent_summary(prompt: str, top_k: int, recent_days: int, model_name: str,
                        backend: str = "ollama") -> None:
     """Summarize recent papers directly from DB metadata instead of vector search."""
@@ -681,6 +821,18 @@ _ts("about to render sidebar")
 
 with st.sidebar:
     st.header("Settings")
+    query_mode = st.selectbox(
+        "Query mode",
+        ["Single-pass", "ReAct"],
+        index=0,
+        help=(
+            "Single-pass: one Gemini pre-RAG pass extracts intent (date "
+            "filters, citation downloads) and one retrieve() call feeds the "
+            "answer. ReAct: bounded multi-step loop where Gemini chooses "
+            "search_papers / list_paper_titles / set_time_range across up "
+            "to 3 rounds before answering. Gemini backend only."
+        ),
+    )
     top_k = st.slider("Number of retrieved chunks", 1, 20, TOP_K)
     use_reranker = st.toggle(
         "Cross-encoder reranker",
@@ -854,10 +1006,18 @@ _ts("main area rendered, script body finished")
 
 if active_prompt:
     if active_mode == "recent_summary":
+        # The 7-day-summary preset always runs the metadata-only path,
+        # regardless of whether the sidebar is set to ReAct mode.
         run_recent_summary(
             active_prompt,
             top_k=active_top_k,
             recent_days=7,
+            model_name=model_name,
+            backend=backend,
+        )
+    elif query_mode == "ReAct":
+        run_react_query(
+            active_prompt,
             model_name=model_name,
             backend=backend,
         )
