@@ -7,6 +7,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from src.config import PDF_DIR, ARXIV_CATEGORY, ARXIV_MAX_RESULTS, ARXIV_SORT_BY
+from src.ingestion.arxiv_rate_limiter import throttle as _arxiv_throttle
 
 ARXIV_API_URL = "http://export.arxiv.org/api/query"
 NAMESPACE = {"atom": "http://www.w3.org/2005/Atom"}
@@ -43,6 +44,7 @@ def search_arxiv(query: str = "", max_results: int = ARXIV_MAX_RESULTS,
         })
         url = f"{ARXIV_API_URL}?{params}"
 
+        _arxiv_throttle()
         with urllib.request.urlopen(url) as response:
             data = response.read()
 
@@ -77,9 +79,7 @@ def search_arxiv(query: str = "", max_results: int = ARXIV_MAX_RESULTS,
                 "pdf_url": pdf_link,
             })
 
-        # Respect arXiv rate limits: 1 request per 3 seconds
-        if start + batch_size < max_results:
-            time.sleep(3)
+        # Rate limiting is enforced by _arxiv_throttle() above; no extra sleep needed.
 
     return papers
 
@@ -102,6 +102,7 @@ def download_pdf(paper: dict, output_dir: Path = PDF_DIR) -> Path | None:
         return pdf_path
 
     try:
+        _arxiv_throttle()
         urllib.request.urlretrieve(paper["pdf_url"], pdf_path)
         return pdf_path
     except Exception as e:

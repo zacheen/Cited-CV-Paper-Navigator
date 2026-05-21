@@ -42,6 +42,9 @@ def run_past_trend(days_back: int = 7, min_new_papers: int = 3, max_days_back: i
     stop_reason = f"reached max_days_back={max_days_back}"
 
     for i in range(max_days_back):
+        # arXiv rate limiting is handled centrally by arxiv_rate_limiter.throttle()
+        # inside get_arxiv_details / download_pdf, so no manual sleep here.
+
         target_date = today - timedelta(days=i)
         date_str = target_date.strftime("%Y-%m-%d")
 
