@@ -10,6 +10,9 @@ before using this module. Get one for free at https://aistudio.google.com/apikey
 
 import datetime
 import os
+import sys
+import time
+from typing import Callable, TypeVar
 
 from google import genai
 from google.genai import types
@@ -17,6 +20,64 @@ from google.genai import types
 from src.config import GEMINI_MODEL, RAG_SYSTEM_PROMPT, RAG_USER_TEMPLATE
 from src.rag import tools as rag_tools
 from src.rag.tools import get_tools, retrieval_query_state, time_range_state
+
+_T = TypeVar("_T")
+
+# HTTP status codes returned by Gemini when the server is temporarily overloaded
+# or our free-tier quota burst hits per-minute limits. Both are transient and
+# usually clear within seconds, so retry-with-backoff handles them well.
+_RETRYABLE_HTTP_CODES = (429, 503)
+
+
+def _is_retryable_gemini_error(exc: Exception) -> bool:
+    """True if the exception looks like a transient server-side issue.
+
+    Checks two paths:
+      1. Typed exception with a numeric ``code`` attribute (preferred).
+      2. Falls back to string-matching on the exception repr — Gemini's
+         error messages reliably include "503 UNAVAILABLE" / "429
+         RESOURCE_EXHAUSTED" even when wrapped in opaque outer exceptions.
+    """
+    code = getattr(exc, "code", None)
+    if isinstance(code, int) and code in _RETRYABLE_HTTP_CODES:
+        return True
+    msg = str(exc)
+    return (
+        "503" in msg
+        or "UNAVAILABLE" in msg
+        or "429" in msg
+        or "RESOURCE_EXHAUSTED" in msg
+    )
+
+
+def _gemini_retry(
+    fn: Callable[[], _T],
+    *,
+    max_retries: int = 3,
+    label: str = "Gemini call",
+) -> _T:
+    """Call ``fn()`` with exponential backoff retry on Gemini overload errors.
+
+    Backoff schedule: 5s → 15s → 45s (total budget ≈ 65s across 3 retries).
+    Non-retryable exceptions propagate immediately. Retryable ones after the
+    last attempt also propagate so the caller can show the original error.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            if _is_retryable_gemini_error(exc) and attempt < max_retries:
+                wait = 5 * (3 ** attempt)  # 5, 15, 45
+                print(
+                    f"[gemini-retry] {label} hit overload "
+                    f"({type(exc).__name__}: {str(exc)[:100]}), "
+                    f"backing off {wait}s (retry {attempt + 1}/{max_retries})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(wait)
+                continue
+            raise
 
 # Debug visibility for the pre-RAG pass. The sidebar reads this to surface
 # why a tool may not have fired (model error, network failure, AFC issue).
@@ -99,10 +160,13 @@ def generate_answer(question: str, context: str,
     client = _get_client()
     contents = _build_contents(question, context, chat_history)
 
-    response = client.models.generate_content(
-        model=model,
-        contents=contents,
-        config=types.GenerateContentConfig(system_instruction=RAG_SYSTEM_PROMPT),
+    response = _gemini_retry(
+        lambda: client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(system_instruction=RAG_SYSTEM_PROMPT),
+        ),
+        label="generate_answer",
     )
     return response.text or ""
 
@@ -124,12 +188,30 @@ def generate_answer_stream(question: str, context: str,
     client = _get_client()
     contents = _build_contents(question, context, chat_history)
 
-    stream = client.models.generate_content_stream(
-        model=model,
-        contents=contents,
-        config=types.GenerateContentConfig(system_instruction=RAG_SYSTEM_PROMPT),
-    )
-    for chunk in stream:
+    # Eagerly consume the first chunk inside the retry boundary so 503/429
+    # surface here (the SDK's stream is lazy — without forcing the first
+    # iteration, errors at request time would escape after the retry helper
+    # has returned). Subsequent chunks rarely fail and are yielded normally.
+    def _init_stream():
+        stream = client.models.generate_content_stream(
+            model=model,
+            contents=contents,
+            config=types.GenerateContentConfig(system_instruction=RAG_SYSTEM_PROMPT),
+        )
+        iterator = iter(stream)
+        try:
+            first = next(iterator)
+        except StopIteration:
+            first = None
+        return first, iterator
+
+    first, rest = _gemini_retry(_init_stream, label="generate_answer_stream")
+
+    if first is not None:
+        token = first.text
+        if token:
+            yield token
+    for chunk in rest:
         token = chunk.text
         if token:
             yield token
@@ -180,13 +262,16 @@ def run_pre_rag_pass(prompt: str, model: str = GEMINI_MODEL) -> None:
     )
 
     try:
-        response = client.models.generate_content(
-            model=model,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=system_instruction,
-                tools=get_tools(),
+        response = _gemini_retry(
+            lambda: client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=system_instruction,
+                    tools=get_tools(),
+                ),
             ),
+            label="run_pre_rag_pass",
         )
         # If AFC ran, the SDK exposes the conversation; surface any function
         # calls the model proposed (helps debug "tool wasn't called" issues).
